@@ -1,42 +1,49 @@
-// MMGA $MONK Token Minting Backend
-// Handles session verification and partial transaction signing
+// MMGA Minting Backend with Balance Storage
+// Allows users to accumulate MONK and mint in batches
 
-const express = require('express');
-const cors = require('cors');
-const { 
-  Connection, 
-  PublicKey, 
-  Transaction,
+import express from 'express';
+import cors from 'cors';
+import {
+  Connection,
   Keypair,
-  clusterApiUrl
-} = require('@solana/web3.js');
-const {
-  createMintToCheckedInstruction,
-  getAssociatedTokenAddress,
+  PublicKey,
+  Transaction,
+  SystemProgram,
+  TransactionInstruction,
+  LAMPORTS_PER_SOL,
+} from '@solana/web3.js';
+import {
+  TOKEN_2022_PROGRAM_ID,
+  createMintToInstruction,
+  getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
-  TOKEN_2022_PROGRAM_ID
-} = require('@solana/spl-token');
-const bs58 = require('bs58');
-const fs = require('fs');
+  getAccount,
+} from '@solana/spl-token';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ========================================
-// CONFIGURATION
-// ========================================
-
-const SOLANA_RPC = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
+// Configuration
 const PORT = process.env.PORT || 3001;
+const SOLANA_RPC = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
+const MONK_TOKEN = '4ec5P6tYDUCQbv6VcqLPqXtD8h5FEnU5VEHSUht5Hzhv';
+const SQUAD_ADDRESS = '7yyyxcNzjjQ5mc6tCFgFkU4nh4F7w2pwrMnaKcQmYkN3';
 
-// Token configuration
-const MONK_TOKEN = new PublicKey('4ec5P6tYDUCQbv6VcqLPqXtD8h5FEnU5VEHSUht5Hzhv');
-const SQUAD_AUTHORITY = new PublicKey('7yyyxcNzjjQ5mc6tCFgFkU4nh4F7w2pwrMnaKcQmYkN3');
+// Balance storage file
+const BALANCE_FILE = path.join(__dirname, 'monk-balances.json');
 
-// Load deployer keypair (one of the Squad signers)
-// IMPORTANT: Keep this secret! Never commit to git
-const DEPLOYER_KEYPAIR = loadKeypair();
+// Initialize connection
+const connection = new Connection(SOLANA_RPC, 'confirmed');
+
+// Load deployer keypair
+let DEPLOYER_KEYPAIR;
 
 function loadKeypair() {
   // Try environment variable first (for Render deployment)
@@ -66,264 +73,268 @@ function loadKeypair() {
   }
 }
 
-const connection = new Connection(SOLANA_RPC, 'confirmed');
+// Load balances from file
+function loadBalances() {
+  try {
+    if (fs.existsSync(BALANCE_FILE)) {
+      const data = fs.readFileSync(BALANCE_FILE, 'utf-8');
+      return JSON.parse(data);
+    }
+  } catch (error) {
+    console.error('Error loading balances:', error.message);
+  }
+  return {};
+}
 
-console.log(`🚀 MMGA Minting Backend Starting...`);
-console.log(`📍 RPC: ${SOLANA_RPC}`);
-console.log(`🪙 Token: ${MONK_TOKEN.toString()}`);
-console.log(`👥 Squad: ${SQUAD_AUTHORITY.toString()}`);
-console.log(`🔑 Deployer: ${DEPLOYER_KEYPAIR.publicKey.toString()}`);
+// Save balances to file
+function saveBalances(balances) {
+  try {
+    fs.writeFileSync(BALANCE_FILE, JSON.stringify(balances, null, 2));
+  } catch (error) {
+    console.error('Error saving balances:', error.message);
+  }
+}
 
-// ========================================
-// SESSION VERIFICATION
-// ========================================
+// In-memory balance cache (synced with file)
+let balances = loadBalances();
 
-/**
- * Verify meditation session is valid
- * In production, this should:
- * - Check biometric detection results
- * - Verify session duration
- * - Check user hasn't already minted for this session
- * - Validate timestamp is recent
- */
+// Verify session data
 function verifySession(sessionData) {
-  const { 
-    sessionId, 
-    duration, 
-    timestamp, 
-    biometricValid,
-    userWallet 
-  } = sessionData;
-
+  const { sessionId, duration, timestamp, biometricValid, userWallet } = sessionData;
+  
   // Basic validation
   if (!sessionId || !duration || !timestamp || !userWallet) {
-    return { valid: false, error: 'Missing required fields' };
+    throw new Error('Missing required session data');
   }
-
-  // Check biometric validation passed
+  
   if (!biometricValid) {
-    return { valid: false, error: 'Biometric validation failed' };
+    throw new Error('Biometric validation failed');
   }
-
-  // Check minimum duration (e.g., 5 minutes = 300 seconds)
-  if (duration < 300) {
-    return { valid: false, error: 'Session too short (minimum 5 minutes)' };
-  }
-
-  // Check timestamp is recent (within last 10 minutes)
-  const now = Date.now();
-  const sessionTime = new Date(timestamp).getTime();
-  const ageMinutes = (now - sessionTime) / 1000 / 60;
   
-  if (ageMinutes > 10) {
-    return { valid: false, error: 'Session expired (must claim within 10 minutes)' };
+  // Verify duration (at least 60 seconds = 1 MONK)
+  if (duration < 60) {
+    throw new Error('Session too short (minimum 60 seconds)');
   }
-
-  // TODO: Check database that this sessionId hasn't been claimed already
-  // TODO: Check rate limiting (e.g., max 1 mint per hour per wallet)
-
-  return { valid: true };
+  
+  // Verify timestamp is recent (within last hour)
+  const sessionTime = new Date(timestamp);
+  const now = new Date();
+  const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+  
+  if (sessionTime < hourAgo || sessionTime > now) {
+    throw new Error('Invalid session timestamp');
+  }
+  
+  // Calculate earned MONK (1 per 60 seconds)
+  const earnedMonk = Math.floor(duration / 60);
+  
+  return earnedMonk;
 }
 
-// ========================================
-// TRANSACTION BUILDING
-// ========================================
+// ENDPOINTS
 
-/**
- * Create a partially-signed transaction for minting 1 MONK token
- * User will complete signing and pay gas fees
- */
-async function createMintTransaction(userWalletAddress) {
-  const userPubkey = new PublicKey(userWalletAddress);
-
-  // Get user's token account address
-  const userTokenAccount = await getAssociatedTokenAddress(
-    MONK_TOKEN,
-    userPubkey,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
-
-  // Check if account exists
-  const accountInfo = await connection.getAccountInfo(userTokenAccount);
-  const needsAccountCreation = accountInfo === null;
-
-  // Create transaction
-  const transaction = new Transaction();
-  
-  // Add create account instruction if needed
-  if (needsAccountCreation) {
-    const createAccountIx = createAssociatedTokenAccountInstruction(
-      userPubkey, // payer (user pays)
-      userTokenAccount,
-      userPubkey, // owner
-      MONK_TOKEN,
-      TOKEN_2022_PROGRAM_ID
-    );
-    transaction.add(createAccountIx);
-  }
-
-  // Add mint instruction
-  const mintIx = createMintToCheckedInstruction(
-    MONK_TOKEN,
-    userTokenAccount,
-    SQUAD_AUTHORITY, // mint authority (Squad controls this)
-    1, // amount (1 token)
-    0, // decimals
-    [], // no additional signers needed here
-    TOKEN_2022_PROGRAM_ID
-  );
-  transaction.add(mintIx);
-
-  // Get recent blockhash
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-  transaction.recentBlockhash = blockhash;
-  transaction.feePayer = userPubkey; // User pays gas
-
-  // Partially sign with deployer keypair
-  // This proves backend authorization
-  transaction.partialSign(DEPLOYER_KEYPAIR);
-
-  return {
-    transaction: transaction.serialize({
-      requireAllSignatures: false, // User hasn't signed yet
-      verifySignatures: false
-    }),
-    blockhash,
-    lastValidBlockHeight,
-    needsAccountCreation
-  };
-}
-
-// ========================================
-// API ENDPOINTS
-// ========================================
-
-/**
- * Health check
- */
+// Health check
 app.get('/health', (req, res) => {
-  res.json({ 
+  res.json({
     status: 'ok',
-    token: MONK_TOKEN.toString(),
-    deployer: DEPLOYER_KEYPAIR.publicKey.toString()
+    token: MONK_TOKEN,
+    squad: SQUAD_ADDRESS,
+    deployer: DEPLOYER_KEYPAIR.publicKey.toString(),
+    totalWallets: Object.keys(balances).length,
+    totalUnminted: Object.values(balances).reduce((sum, b) => sum + b, 0)
   });
 });
 
-/**
- * Request mint transaction
- * 
- * POST /api/mint
- * Body: {
- *   sessionId: string,
- *   duration: number (seconds),
- *   timestamp: string (ISO),
- *   biometricValid: boolean,
- *   userWallet: string (Solana address)
- * }
- */
-app.post('/api/mint', async (req, res) => {
+// Get user's unminted balance
+app.get('/api/balance/:wallet', (req, res) => {
   try {
-    const sessionData = req.body;
-
-    // Verify session
-    const verification = verifySession(sessionData);
-    if (!verification.valid) {
-      return res.status(400).json({
-        error: verification.error
-      });
-    }
-
-    // Create mint transaction
-    const txData = await createMintTransaction(sessionData.userWallet);
-
-    // Return serialized transaction
+    const wallet = req.params.wallet;
+    const balance = balances[wallet] || 0;
+    
     res.json({
-      success: true,
-      transaction: txData.transaction.toString('base64'),
-      blockhash: txData.blockhash,
-      lastValidBlockHeight: txData.lastValidBlockHeight,
-      message: txData.needsAccountCreation 
-        ? 'First mint - creating token account (~0.36 SOL)'
-        : 'Minting token (~0.002 SOL)'
+      wallet,
+      unmintedBalance: balance
     });
-
   } catch (error) {
-    console.error('Mint error:', error);
-    res.status(500).json({
-      error: 'Failed to create mint transaction',
-      details: error.message
-    });
+    console.error('Balance check error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-/**
- * Verify transaction was successful
- * 
- * POST /api/verify
- * Body: {
- *   signature: string,
- *   userWallet: string
- * }
- */
+// Add earned MONK to balance (called after verified meditation session)
+app.post('/api/earn', async (req, res) => {
+  try {
+    const sessionData = req.body;
+    
+    // Verify session and calculate earned MONK
+    const earnedMonk = verifySession(sessionData);
+    const wallet = sessionData.userWallet;
+    
+    // Add to balance
+    balances[wallet] = (balances[wallet] || 0) + earnedMonk;
+    saveBalances(balances);
+    
+    console.log(`✅ ${wallet} earned ${earnedMonk} MONK (balance: ${balances[wallet]})`);
+    
+    res.json({
+      success: true,
+      earned: earnedMonk,
+      newBalance: balances[wallet],
+      message: `Earned ${earnedMonk} MONK! Total unminted: ${balances[wallet]}`
+    });
+  } catch (error) {
+    console.error('Earn error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Mint tokens (deducts from balance)
+app.post('/api/mint', async (req, res) => {
+  try {
+    const { userWallet, amount = 1 } = req.body;
+    
+    if (!userWallet) {
+      throw new Error('User wallet address required');
+    }
+    
+    // Check balance
+    const currentBalance = balances[userWallet] || 0;
+    if (currentBalance < amount) {
+      throw new Error(`Insufficient balance. You have ${currentBalance} MONK, tried to mint ${amount}`);
+    }
+    
+    // Validate amount
+    if (amount < 1 || amount > 100) {
+      throw new Error('Amount must be between 1 and 100');
+    }
+    
+    const userPublicKey = new PublicKey(userWallet);
+    const mintPublicKey = new PublicKey(MONK_TOKEN);
+    
+    // Get associated token account
+    const userTokenAccount = getAssociatedTokenAddressSync(
+      mintPublicKey,
+      userPublicKey,
+      false,
+      TOKEN_2022_PROGRAM_ID
+    );
+    
+    // Create transaction
+    const transaction = new Transaction();
+    
+    // Check if token account exists, if not create it
+    try {
+      await getAccount(
+        connection,
+        userTokenAccount,
+        'confirmed',
+        TOKEN_2022_PROGRAM_ID
+      );
+    } catch (error) {
+      // Account doesn't exist, add instruction to create it
+      transaction.add(
+        createAssociatedTokenAccountInstruction(
+          userPublicKey, // payer
+          userTokenAccount,
+          userPublicKey,
+          mintPublicKey,
+          TOKEN_2022_PROGRAM_ID
+        )
+      );
+    }
+    
+    // Add mint instruction
+    transaction.add(
+      createMintToInstruction(
+        mintPublicKey,
+        userTokenAccount,
+        DEPLOYER_KEYPAIR.publicKey, // mint authority
+        amount, // amount (no decimals)
+        [],
+        TOKEN_2022_PROGRAM_ID
+      )
+    );
+    
+    // Get recent blockhash
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = userPublicKey;
+    
+    // Partially sign with deployer
+    transaction.partialSign(DEPLOYER_KEYPAIR);
+    
+    // Deduct from balance AFTER successful transaction creation
+    balances[userWallet] -= amount;
+    saveBalances(balances);
+    
+    console.log(`✅ Prepared mint for ${userWallet}: ${amount} MONK (remaining balance: ${balances[userWallet]})`);
+    
+    // Serialize and send back
+    const serialized = transaction.serialize({
+      requireAllSignatures: false,
+      verifySignatures: false
+    });
+    
+    res.json({
+      transaction: serialized.toString('base64'),
+      blockhash,
+      lastValidBlockHeight,
+      amount,
+      remainingBalance: balances[userWallet]
+    });
+  } catch (error) {
+    console.error('Mint error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Verify transaction success (optional endpoint for tracking)
 app.post('/api/verify', async (req, res) => {
   try {
-    const { signature, userWallet } = req.body;
-
-    // Check transaction status
+    const { signature, wallet } = req.body;
+    
+    if (!signature) {
+      throw new Error('Transaction signature required');
+    }
+    
     const txInfo = await connection.getTransaction(signature, {
       commitment: 'confirmed',
       maxSupportedTransactionVersion: 0
     });
-
+    
     if (!txInfo) {
-      return res.status(404).json({
-        error: 'Transaction not found'
-      });
+      throw new Error('Transaction not found');
     }
-
-    if (txInfo.meta?.err) {
-      return res.status(400).json({
-        error: 'Transaction failed',
-        details: txInfo.meta.err
-      });
-    }
-
-    // Get user's token balance
-    const userPubkey = new PublicKey(userWallet);
-    const userTokenAccount = await getAssociatedTokenAddress(
-      MONK_TOKEN,
-      userPubkey,
-      false,
-      TOKEN_2022_PROGRAM_ID
-    );
-
-    const tokenBalance = await connection.getTokenAccountBalance(userTokenAccount);
-
+    
     res.json({
       success: true,
-      balance: tokenBalance.value.amount,
-      decimals: tokenBalance.value.decimals,
-      message: 'Token minted successfully!'
+      signature,
+      slot: txInfo.slot,
+      wallet,
+      balance: balances[wallet] || 0
     });
-
   } catch (error) {
-    console.error('Verify error:', error);
-    res.status(500).json({
-      error: 'Failed to verify transaction',
-      details: error.message
-    });
+    console.error('Verification error:', error);
+    res.status(400).json({ error: error.message });
   }
 });
 
-// ========================================
-// START SERVER
-// ========================================
+// Initialize
+DEPLOYER_KEYPAIR = loadKeypair();
+
+console.log('🚀 MMGA Minting Backend Starting...');
+console.log('📍 RPC:', SOLANA_RPC);
+console.log('🪙 Token:', MONK_TOKEN);
+console.log('👥 Squad:', SQUAD_ADDRESS);
+console.log('🔑 Deployer:', DEPLOYER_KEYPAIR.publicKey.toString());
+console.log('💾 Balance file:', BALANCE_FILE);
 
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
-  console.log(`📡 Endpoints:`);
-  console.log(`   GET  /health - Health check`);
-  console.log(`   POST /api/mint - Request mint transaction`);
-  console.log(`   POST /api/verify - Verify transaction`);
+  console.log('📡 Endpoints:');
+  console.log('   GET  /health - Health check');
+  console.log('   GET  /api/balance/:wallet - Get unminted balance');
+  console.log('   POST /api/earn - Add earned MONK to balance');
+  console.log('   POST /api/mint - Mint tokens (deducts from balance)');
+  console.log('   POST /api/verify - Verify transaction');
 });
