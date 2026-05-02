@@ -103,8 +103,6 @@ app.get('/api/balance/:wallet', async (req, res) => {
 });
 
 // ========== ENDPOINT 3: MINT TOKENS ==========
-const { Connection, PublicKey, Transaction, SystemProgram } = require('@solana/web3.js');
-
 app.post('/api/mint', async (req, res) => {
   try {
     const { userWallet, amount } = req.body;
@@ -133,44 +131,18 @@ app.post('/api/mint', async (req, res) => {
     
     console.log(`Balance check passed: ${user.unmintedBalance} >= ${amount}`);
     
-    // Create REAL Solana transaction
-    const connection = new Connection('https://api.mainnet-beta.solana.com');
-    const userPublicKey = new PublicKey(userWallet);
-    
-    // Get recent blockhash
-    const { blockhash } = await connection.getLatestBlockhash();
-    
-    // Create transaction
-    const transaction = new Transaction();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = userPublicKey;
-    
-    // Add a simple transfer instruction (0.000001 SOL memo transaction)
-    // This is a placeholder - you'll need to implement actual SPL token minting
-    transaction.add(
-      SystemProgram.transfer({
-        fromPubkey: userPublicKey,
-        toPubkey: userPublicKey, // Send to self (memo transaction)
-        lamports: 1 // Minimal amount
-      })
-    );
-    
-    // Serialize transaction
-    const serializedTransaction = transaction.serialize({
-      requireAllSignatures: false,
-      verifySignatures: false
-    });
-    
-    const base64Transaction = serializedTransaction.toString('base64');
-    
-    // Deduct balance (only after successful mint)
+    // Deduct balance immediately (authorize the mint)
     user.unmintedBalance -= amount;
     await user.save();
     
-    console.log(`Balance deducted. New balance: ${user.unmintedBalance}`);
+    console.log(`Mint authorized. New balance: ${user.unmintedBalance}`);
     
+    // Return success - frontend will create and sign the transaction
     res.json({
-      transaction: base64Transaction
+      success: true,
+      amount: amount,
+      newBalance: user.unmintedBalance,
+      message: 'Mint authorized - create transaction on frontend'
     });
     
   } catch (error) {
