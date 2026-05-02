@@ -4,8 +4,6 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { Connection, Keypair, PublicKey, Transaction } = require('@solana/web3.js');
-const { Metaplex, keypairIdentity, bundlrStorage } = require('@metaplex-foundation/js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
