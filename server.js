@@ -39,15 +39,29 @@ const SQUAD_AUTHORITY = new PublicKey('7yyyxcNzjjQ5mc6tCFgFkU4nh4F7w2pwrMnaKcQmY
 const DEPLOYER_KEYPAIR = loadKeypair();
 
 function loadKeypair() {
+  // Try environment variable first (for Render deployment)
+  if (process.env.DEPLOYER_KEYPAIR) {
+    try {
+      const keypairData = JSON.parse(process.env.DEPLOYER_KEYPAIR);
+      console.log('✅ Loading keypair from DEPLOYER_KEYPAIR environment variable');
+      return Keypair.fromSecretKey(Uint8Array.from(keypairData));
+    } catch (error) {
+      console.error('Failed to parse DEPLOYER_KEYPAIR from environment:', error.message);
+      process.exit(1);
+    }
+  }
+  
+  // Fall back to file path (for local development)
   const keypairPath = process.env.DEPLOYER_KEYPAIR_PATH || 
     `${process.env.HOME}/.config/solana/deployer.json`;
   
   try {
     const keypairData = JSON.parse(fs.readFileSync(keypairPath, 'utf-8'));
+    console.log(`✅ Loading keypair from file: ${keypairPath}`);
     return Keypair.fromSecretKey(Uint8Array.from(keypairData));
   } catch (error) {
     console.error('Failed to load deployer keypair:', error.message);
-    console.error('Set DEPLOYER_KEYPAIR_PATH environment variable');
+    console.error('Set DEPLOYER_KEYPAIR or DEPLOYER_KEYPAIR_PATH environment variable');
     process.exit(1);
   }
 }
